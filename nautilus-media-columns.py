@@ -31,6 +31,9 @@ try:
 except ImportError:
     GdkPixbuf = None
 
+from mutagen import File
+from mutagen.easyid3 import EasyID3
+
 
 # Logging
 import logging
@@ -97,7 +100,8 @@ Gst.init(None)
 # Config
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
-SUPPORTED_EXTS = VIDEO_EXTS | IMAGE_EXTS
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".flac"}
+SUPPORTED_EXTS = VIDEO_EXTS | IMAGE_EXTS | AUDIO_EXTS
 
 DISCOVER_TIMEOUT_NS = 2 * Gst.SECOND
 
@@ -158,6 +162,9 @@ def _get_db() -> sqlite3.Connection:
           dims TEXT,
           dur TEXT,
           fps TEXT,
+          artist TEXT,
+          album TEXT,
+          track TEXT,
           last_access_ns INTEGER NOT NULL DEFAULT 0
         )
         """
@@ -204,12 +211,15 @@ def _mem_cache_put(
     path: str,
     mtime_ns: int,
     size: int,
-    dimensions: str,
-    duration: str,
-    framerate: str,
+    dimensions: str = "",
+    duration: str = "",
+    framerate: str = "",
+    artist: str = "",
+    album: str = "",
+    track: str = ""
 ) -> None:
     """Save a cache entry in memory for fast reuse."""
-    _MEM_CACHE[path] = (mtime_ns, size, dimensions, duration, framerate)
+    _MEM_CACHE[path] = (mtime_ns, size, dimensions, duration, framerate, artist, album, track)
     if len(_MEM_CACHE) > _MEM_CACHE_MAX:
         # FIFO eviction (dict keeps insertion order in Python 3.7+)
         evicted = next(iter(_MEM_CACHE))
@@ -217,7 +227,7 @@ def _mem_cache_put(
         log_debug(f"Mem-cache evicted: {evicted}")
 
 
-def _cache_get(path: str, mtime_ns: int, size: int) -> Optional[Tuple[str, str, str]]:
+def _cache_get(path: str, mtime_ns: int, size: int) -> Optional[Tuple[str, str, str, str, str, str]]:
     """Get cached values for a file if they are still valid."""
     global _pending_writes
     cached = _MEM_CACHE.get(path)
@@ -228,7 +238,7 @@ def _cache_get(path: str, mtime_ns: int, size: int) -> Optional[Tuple[str, str, 
     try:
         conn = _get_db()
         row = conn.execute(
-            "SELECT mtime_ns,size,dims,dur,fps FROM cache WHERE path=?",
+            "SELECT mtime_ns,size,dims,dur,fps,artist,album,track FROM cache WHERE path=?",
             (path,),
         ).fetchone()
     except sqlite3.Error as e:
@@ -247,7 +257,7 @@ def _cache_get(path: str, mtime_ns: int, size: int) -> Optional[Tuple[str, str, 
             log_debug(f"Cache stale delete failed (non-fatal): {type(e).__name__}: {e}")
         return None
 
-    dimensions, duration, framerate = row[2] or "", row[3] or "", row[4] or ""
+    dimensions, duration, framerate, artist, album, track = row[2] or "", row[3] or "", row[4] or "", row[5] or "", row[6] or "", row[7] or ""
     try:
         conn.execute(
             "UPDATE cache SET last_access_ns=? WHERE path=?",
@@ -263,26 +273,29 @@ def _cache_get(path: str, mtime_ns: int, size: int) -> Optional[Tuple[str, str, 
 
     _mem_cache_put(path, mtime_ns, size, dimensions, duration, framerate)
     log_debug(f"Cache hit (db): {path}")
-    return dimensions, duration, framerate
+    return dimensions, duration, framerate, artist, album, track
 
 
 def _cache_put(
     path: str,
     mtime_ns: int,
     size: int,
-    dimensions: str,
-    duration: str,
-    framerate: str,
+    dimensions: str = "", 
+    duration: str = "",
+    framerate: str = "",
+    artist: str = "",
+    album: str = "",
+    track: str = ""
 ) -> None:
     """Save media metadata to the cache."""
     global _pending_writes
-    _mem_cache_put(path, mtime_ns, size, dimensions, duration, framerate)
+    _mem_cache_put(path, mtime_ns, size, dimensions, duration, framerate, artist, album, track)
 
     try:
         conn = _get_db()
         conn.execute(
-            "INSERT OR REPLACE INTO cache(path,mtime_ns,size,dims,dur,fps,last_access_ns) VALUES(?,?,?,?,?,?,?)",
-            (path, mtime_ns, size, dimensions, duration, framerate, time.time_ns()),
+            "INSERT OR REPLACE INTO cache(path,mtime_ns,size,dims,dur,fps,artist,album,track,last_access_ns) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (path, mtime_ns, size, dimensions, duration, framerate, artist, album, track, time.time_ns()),
         )
         _pending_writes += 1
         if _pending_writes >= COMMIT_EVERY:
@@ -466,6 +479,40 @@ def _probe_video(path: str) -> VideoMetadata:
     return VideoMetadata(duration, dimensions, framerate)
 
 
+class AudioMetadata(NamedTuple):
+    """Container for audio metadata"""
+    artist: str
+    album: str
+    track: str
+
+def _probe_audio(path: str) -> AudioMetadata:
+    log_debug(f"Probe audio: {path}")
+
+    artist = ""
+    album = ""
+    track = ""
+
+    try:
+        if path.lower().endswith(".mp3"):
+           audio = EasyID3(path)
+        else:
+            audio = File(path, easy=True) # mutagen.File()
+
+        if audio is not None:
+            log_debug(f"Raw mutagen keys: {list(audio.keys())} | Type: {type(audio)}")
+            if 'artist' in audio and audio['artist']:
+                artist = audio['artist'][0]
+            if 'album' in audio and audio['album']:
+                album = audio['album'][0]
+            if 'tracknumber' in audio and audio['tracknumber']:
+                track = audio['tracknumber'][0]
+    except Exception as e:
+        log_debug(f"Mutagen read failed for {path}: {type(e).__name__} - {e}")
+
+    log_debug(f"Audio probed -> art={artist} alb={album} #={track}")
+    return AudioMetadata(artist, album, track)
+
+
 class MediaColumns(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvider):
     """Extension: Adds media metadata columns to Nautilus."""
 
@@ -493,6 +540,24 @@ class MediaColumns(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvid
                 label="FPS",
                 description="Video framerate (FPS)",
             ),
+            Nautilus.Column(
+                name="NautilusPython::audio_artist",
+                attribute="audio_artist",
+                label="Artist",
+                description="Audio file artist"
+            ),
+            Nautilus.Column(
+                name="NautilusPython::audio_album",
+                attribute="audio_album",
+                label="Album",
+                description="Audio file's album"
+            ),
+            Nautilus.Column(
+                name="NautilusPython::audio_track",
+                attribute="audio_track",
+                label="Track #",
+                description="Audio file track number"
+            )
         ]
 
     # Called once per file by Nautilus
@@ -539,18 +604,27 @@ class MediaColumns(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvid
 
         cached_entry = _cache_get(path, mtime_ns, size)
         if cached_entry is not None:
-            dimensions, duration, framerate = cached_entry
+            dimensions, duration, framerate, artist, album, track = cached_entry
             if dimensions:
                 file.add_string_attribute("media_dimensions", dimensions)
             if duration:
                 file.add_string_attribute("media_duration", duration)
             if framerate:
                 file.add_string_attribute("media_framerate", framerate)
+            if artist:
+                file.add_string_attribute("audio_artist", artist)
+            if album:
+                file.add_string_attribute("audio_album", album)
+            if track:
+                file.add_string_attribute("audio_track", track)
             return
 
         dimensions = ""
         duration = ""
         framerate = ""
+        artist = ""
+        album = ""
+        track = ""
 
         if ext in IMAGE_EXTS:
             dimensions = _probe_image(path)
@@ -559,8 +633,10 @@ class MediaColumns(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvid
             duration, video_dimensions, framerate = _probe_video(path)
             if video_dimensions:
                 dimensions = video_dimensions
+        if ext in AUDIO_EXTS:
+            artist, album, track = _probe_audio(path)
 
-        _cache_put(path, mtime_ns, size, dimensions, duration, framerate)
+        _cache_put(path, mtime_ns, size, dimensions, duration, framerate, artist, album, track)
 
         if dimensions:
             file.add_string_attribute("media_dimensions", dimensions)
@@ -568,3 +644,9 @@ class MediaColumns(GObject.GObject, Nautilus.ColumnProvider, Nautilus.InfoProvid
             file.add_string_attribute("media_duration", duration)
         if framerate:
             file.add_string_attribute("media_framerate", framerate)
+        if artist:
+            file.add_string_attribute("audio_artist", artist)
+        if album:
+            file.add_string_attribute("audio_album", album)
+        if track:
+            file.add_string_attribute("audio_track", track)
